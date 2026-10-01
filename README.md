@@ -2,7 +2,7 @@
 
 ANER is the Apple Neural Engine Runtime. It evaluates static numerical graphs on the Apple Neural Engine. A value is a matrix with one column per ensemble member. Channels are the state. Coefficients are compiled into the graph, and a repeated linear map stays resident across the horizon.
 
-The public header is `lib/include/aner.h`. Version 0.1.0.
+The public header is `lib/include/aner.h`. Version 0.1.0. `lib/include/aner_lut6.h` compiles a frozen combinational LUT6 netlist into one of those graphs. HELUT calls it for a frozen cleartext circuit of at most 64 lookups and a batch of at most 64, with the wire vector inside 512 channels. Wider batches, larger circuits, flip-flops, and HELUT's encrypted modular path stay on Metal.
 
 ## Requirements
 
@@ -21,6 +21,7 @@ make -C lib install PREFIX=/usr/local
 | Path | File |
 | --- | --- |
 | `include/aner.h` | public header |
+| `include/aner_lut6.h` | LUT6 netlist compiler |
 | `lib/libaner.dylib` | shared library (`libaner.0.dylib`) |
 | `lib/libaner.a` | static archive |
 | `lib/pkgconfig/aner.pc` | pkg-config |

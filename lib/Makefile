@@ -9,11 +9,11 @@ INCLUDEDIR = $(PREFIX)/include
 LIBDIR = $(PREFIX)/lib
 PKGCONFIGDIR = $(LIBDIR)/pkgconfig
 
-LIB_OBJS = build/graph.o build/cpu.o build/program.o build/ane.o
+LIB_OBJS = build/graph.o build/cpu.o build/program.o build/ane.o build/lut6.o
 
 .PHONY: all test python-test install uninstall clean
 
-all: build/libaner.a build/libaner.dylib build/aner-test build/modal
+all: build/libaner.a build/libaner.dylib build/aner-test build/lut6-test build/modal
 
 build:
 	mkdir -p build
@@ -30,6 +30,9 @@ build/program.o: src/program.c include/aner.h src/internal.h | build
 build/ane.o: src/ane.m include/aner.h src/internal.h | build
 	$(CC) $(CFLAGS) -c src/ane.m -o $@
 
+build/lut6.o: src/lut6.c include/aner.h include/aner_lut6.h | build
+	$(CC) $(CFLAGS) -c src/lut6.c -o $@
+
 build/libaner.a: $(LIB_OBJS)
 	ar rcs $@ $(LIB_OBJS)
 
@@ -44,11 +47,15 @@ build/libaner.dylib: build/libaner.0.dylib
 build/aner-test: src/test_main.c build/libaner.a
 	$(CC) $(CFLAGS) src/test_main.c build/libaner.a $(FRAMEWORKS) -o $@
 
+build/lut6-test: src/lut6_test.c build/libaner.a
+	$(CC) $(CFLAGS) src/lut6_test.c build/libaner.a $(FRAMEWORKS) -o $@
+
 build/modal: examples/modal.c build/libaner.a
 	$(CC) $(CFLAGS) examples/modal.c build/libaner.a $(FRAMEWORKS) -o $@
 
-test: build/aner-test build/modal python-test
+test: build/aner-test build/lut6-test build/modal python-test
 	./build/aner-test
+	./build/lut6-test
 	./build/modal
 
 python-test: build/libaner.dylib
@@ -57,6 +64,7 @@ python-test: build/libaner.dylib
 install: build/libaner.a build/libaner.0.dylib build/libaner.dylib build/modal
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(INCLUDEDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(PKGCONFIGDIR)
 	install -m 644 include/aner.h $(DESTDIR)$(INCLUDEDIR)/aner.h
+	install -m 644 include/aner_lut6.h $(DESTDIR)$(INCLUDEDIR)/aner_lut6.h
 	install -m 644 build/libaner.a $(DESTDIR)$(LIBDIR)/libaner.a
 	install -m 755 build/libaner.0.dylib $(DESTDIR)$(LIBDIR)/libaner.0.dylib
 	ln -sfn libaner.0.dylib $(DESTDIR)$(LIBDIR)/libaner.dylib
@@ -64,7 +72,7 @@ install: build/libaner.a build/libaner.0.dylib build/libaner.dylib build/modal
 	install -m 755 build/modal $(DESTDIR)$(BINDIR)/aner-modal
 
 uninstall:
-	rm -f $(DESTDIR)$(INCLUDEDIR)/aner.h
+	rm -f $(DESTDIR)$(INCLUDEDIR)/aner.h $(DESTDIR)$(INCLUDEDIR)/aner_lut6.h
 	rm -f $(DESTDIR)$(LIBDIR)/libaner.a $(DESTDIR)$(LIBDIR)/libaner.dylib $(DESTDIR)$(LIBDIR)/libaner.0.dylib
 	rm -f $(DESTDIR)$(PKGCONFIGDIR)/aner.pc
 	rm -f $(DESTDIR)$(BINDIR)/aner-modal
