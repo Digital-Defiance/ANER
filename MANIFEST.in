@@ -1,0 +1,9 @@
+graft lib
+prune lib/build
+graft python
+global-exclude *.o
+global-exclude *.a
+global-exclude *.dylib
+global-exclude *.pyc
+prune python/tests/__pycache__
+prune **/__pycache__

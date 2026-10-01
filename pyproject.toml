@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aner"
+version = "0.1.0"
+description = "Apple Neural Engine Runtime for ensemble numerical graphs"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.scripts]
+aner-modal = "aner.modal:cli"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["aner*"]
+
+[tool.setuptools.package-data]
+aner = ["*.dylib"]

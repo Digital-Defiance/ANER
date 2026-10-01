@@ -1,0 +1,11 @@
+prefix=@prefix@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: aner
+Description: Ensemble numerical graphs for the Apple Neural Engine
+Version: @version@
+Libs: -L${libdir} -laner -Wl,-rpath,${libdir}
+Libs.private: -framework Foundation -framework IOSurface -framework Accelerate
+Cflags: -I${includedir}
