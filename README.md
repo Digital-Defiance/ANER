@@ -2,6 +2,17 @@
 
 ANER is the Apple Neural Engine Runtime. It evaluates static numerical graphs on the Apple Neural Engine. A value is a matrix with one column per ensemble member. Channels are the state. Coefficients are compiled into the graph, and a repeated linear map stays resident across the horizon.
 
+`ROADMAP.md` proposes the next steps for precision controls, execution/fallback
+reports, measured automatic selection, and reusable buffers, based on HALO's
+controlled integration benchmarks. These are proposals, not current API features.
+
+The [roadmap](ROADMAP.md#priority-relative-to-the-next-halo-run) also records
+priority: broader ANER work does not block HALO's next run. HALO can use its
+tested MLX FP32 path while the GPU is free, or existing ANE inference when
+training needs the GPU. Precision guarantees and actual fallback reporting are
+the first general ANER improvements to pursue; new operations and portability
+work should follow measured application needs.
+
 The public header is `lib/include/aner.h`. Version 0.1.0. `lib/include/aner_lut6.h` compiles a frozen combinational LUT6 netlist into one of those graphs. HELUT calls it for a frozen cleartext circuit of at most 64 lookups and a batch of at most 64, with the wire vector inside 512 channels. Wider batches, larger circuits, flip-flops, and HELUT's encrypted modular path stay on Metal.
 
 ## Requirements
