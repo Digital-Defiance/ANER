@@ -48,4 +48,15 @@ void *aner_gpu_compile(const AnerGraph *graph, int spatial, double *compile_ms);
 int aner_gpu_eval(void *handle, const float *const *inputs, float *const *outputs, double *exec_ms);
 void aner_gpu_release(void *handle);
 
+/* Pipelined GPU evaluation. Each GPU program owns two host-visible buffer sets
+   ("slots", fp32, channels x compiled spatial). The batch scheduler packs a
+   chunk straight into a free slot's input buffers, submits it asynchronously,
+   and packs the next chunk into the other slot while the GPU computes, then
+   waits and unpacks from the slot's output buffers. Set ANER_GPU_PIPELINE=0 to
+   use the synchronous path instead. */
+float *aner_gpu_slot_input(void *handle, int slot, int input_index);
+float *aner_gpu_slot_output(void *handle, int slot, int output_index);
+int aner_gpu_submit(void *handle, int slot);
+int aner_gpu_wait(void *handle, int slot, double *exec_ms);
+
 #endif

@@ -78,6 +78,18 @@ The Neural Engine path requires every channel count to be a multiple of 64 and a
 
 The GPU runs the same op set as the Neural Engine (input, const, conv, scale, repeat, add, mul, sigmoid, and the pointwise helpers built from them), lowered to one MPSGraph executable at optimization level 0. Level 0 is deliberate: the default level 1 runs a placement pass that moves fp16 matmul chains onto the Neural Engine, which would put both halves of a split on the same engine. Both backends compute in fp16, so a split batch matches an Neural-Engine-only batch to fp16 rounding, not to the float32 interpreter.
 
+GPU tuning (environment variables, read when a program is compiled or run; for benchmarking):
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `ANER_GPU_CHUNK` | 4096 | Target GPU chunk width in columns (rounded down to a multiple of the tile). |
+| `ANER_GPU_PIPELINE` | 1 | `0` uses the synchronous GPU worker; `1` keeps two chunks in flight, packing the next straight into shared buffers while the GPU computes. |
+| `ANER_GPU_OPT_LEVEL` | 0 | `1` compiles at MPSGraph optimization level 1, whose placement pass may move fp16 matmuls onto the Neural Engine. Experimental. |
+
+Measured on an M4 Max with HALO's scorer (512-wide residual MLP, 18 linear layers, 65,536 columns): GPU-only rose from 1.08M to 1.67M columns/s and the split from 1.47M to 2.03M, mostly from pipelining (2048: 1.51M / 1.86M) and the 4096 chunk. MLX fp16 on the same network: 1.49M. Optimization level 1 gave no gain and at 8192 moved work onto the Neural Engine (split fell to 1.43M), so level 0 stays the default.
+
+The GPU lowering keeps consts as `[channels, 1]` columns that broadcast for free, and lowers a diagonal square conv (`aner_scale`, the scale inside `aner_gelu`) to an elementwise multiply instead of a dense matmul.
+
 On an M4 Max, the 512-mode, 128-step, 4096-column rollout runs at about 12 TFLOPS on the Neural Engine alone, about 11 on the GPU alone, and about 23 split across both, close to 1.9× over either engine. The split gain needs a batch wide enough to keep both engines fed; a batch that fits in one tile runs on a single engine.
 
 ## Example
