@@ -1,10 +1,12 @@
 #include "aner.h"
 #include "internal.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 const char *aner_version(void) {
     return ANER_VERSION_STRING;
@@ -20,7 +22,67 @@ struct AnerProgram {
     void *ane;
     void *gpu;
     double compile_ms;
+    /* Measured wall milliseconds per chunk for each engine, [0] Neural Engine tile,
+       [1] GPU chunk; 0 = unknown. Seeded at compile time for split programs and
+       refined during batches. The split scheduler uses them to stop an engine from
+       claiming work the other engine would finish sooner. */
+    _Atomic double est_ms[2];
 };
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
+static void update_estimate(AnerProgram *program, int engine, double sample) {
+    if (sample <= 0)
+        return;
+    double old = atomic_load(&program->est_ms[engine]);
+    atomic_store(&program->est_ms[engine], old > 0 ? 0.7 * old + 0.3 * sample : sample);
+}
+
+/* Time one Neural Engine tile and one GPU chunk on zero input (one warm-up run, one
+   timed run each) so a split's very first batch already knows which engine is faster:
+   a deep chain can be several times faster on the Neural Engine, a wide MLP on the GPU. */
+static void calibrate_split(AnerProgram *program) {
+    const AnerGraph *g = program->graph;
+    int widths[2] = {program->spatial, program->gpu_spatial};
+    for (int e = 0; e < 2; e++) {
+        int width = widths[e];
+        const float **in = calloc((size_t)(g->ninputs > 0 ? g->ninputs : 1), sizeof(float *));
+        float **out = calloc((size_t)(g->noutputs > 0 ? g->noutputs : 1), sizeof(float *));
+        int ok = in && out;
+        for (int i = 0; ok && i < g->nops; i++) {
+            const AnerOp *op = &g->ops[i];
+            if (op->kind == ANER_INPUT &&
+                !(in[op->input_index] = calloc((size_t)op->channels * (size_t)width, sizeof(float))))
+                ok = 0;
+            if (ok && op->is_output && !out[op->output_index] &&
+                !(out[op->output_index] = calloc((size_t)op->channels * (size_t)width, sizeof(float))))
+                ok = 0;
+        }
+        double timed = 0;
+        for (int rep = 0; ok && rep < 2; rep++) {
+            double ms = 0, t0 = now_ms();
+            int rc = e == 0 ? aner_ane_eval(program->ane, in, out, &ms) : aner_gpu_eval(program->gpu, in, out, &ms);
+            if (rc != 0) {
+                timed = 0;
+                break;
+            }
+            timed = now_ms() - t0;  /* the second run is the timed one */
+        }
+        atomic_store(&program->est_ms[e], timed);
+        if (in)
+            for (int i = 0; i < g->ninputs; i++)
+                free((void *)in[i]);
+        if (out)
+            for (int i = 0; i < g->noutputs; i++)
+                free(out[i]);
+        free(in);
+        free(out);
+    }
+}
 
 /* The GPU is far more efficient on wide chunks than on one 64-column tile: a
    128-step chain runs at ~13 TFLOPS on 2048 columns but under 3 on 64, because
@@ -84,6 +146,10 @@ AnerProgram *aner_compile_scheduled(const AnerGraph *graph, int spatial, AnerSch
     }
     /* Report the slower compile; both happen before the first run. */
     program->compile_ms = ane_ms > gpu_ms ? ane_ms : gpu_ms;
+    atomic_store(&program->est_ms[0], 0.0);
+    atomic_store(&program->est_ms[1], 0.0);
+    if (schedule == ANER_SCHED_SPLIT && program->on_ane && program->on_gpu)
+        calibrate_split(program);
     return program;
 }
 
@@ -294,8 +360,10 @@ typedef struct {
     const float *const *inputs;
     float *const *outputs;
     int batch;
+    int nworkers;
     _Atomic int cursor;
     _Atomic int failed;
+    _Atomic int active;  /* workers still claiming; the last one never declines */
 } SplitJob;
 
 typedef struct {
@@ -304,9 +372,53 @@ typedef struct {
     void *handle;
     int tile_width;   /* columns this worker claims and its engine was compiled for */
     int pipelined;    /* GPU worker: two chunks in flight via aner_gpu_submit/wait */
+    int engine;       /* 0 Neural Engine, 1 GPU: index into program->est_ms */
+    int other_width;  /* the other engine's chunk width */
+    int forced;       /* set when this worker must finish the batch alone */
     double busy_ms;
     int tiles;
 } Worker;
+
+/* Claim this worker's next chunk only if it can finish it before the other engine could
+   finish all remaining columns alone. `pending` counts this worker's chunks already in
+   flight, which the new chunk would queue behind. Without estimates, claim greedily. */
+static int should_claim(const Worker *w, int remaining, int pending) {
+    AnerProgram *p = w->job->program;
+    double mine = atomic_load(&p->est_ms[w->engine]);
+    double theirs = atomic_load(&p->est_ms[1 - w->engine]);
+    if (mine <= 0 || theirs <= 0)
+        return 1;
+    double their_time = ceil((double)remaining / (double)w->other_width) * theirs;
+    return mine * (double)(1 + pending) < their_time;
+}
+
+/* Atomically claim the next chunk for w. Returns 1 with the column range, or 0 when the
+   batch is done, failed, or w steps aside for the faster engine. A worker that steps
+   aside leaves the batch to the others; the last active worker is never allowed to step
+   aside, so every column is processed. */
+static int claim_chunk(Worker *w, int pending, int *column_out, int *valid_out) {
+    SplitJob *job = w->job;
+    int width = w->tile_width;
+    for (;;) {
+        if (atomic_load(&job->failed))
+            return 0;
+        int c = atomic_load(&job->cursor);
+        if (c >= job->batch)
+            return 0;
+        if (!w->forced && job->nworkers > 1 && !should_claim(w, job->batch - c, pending)) {
+            if (atomic_fetch_sub(&job->active, 1) > 1)
+                return 0;
+            atomic_fetch_add(&job->active, 1);
+            w->forced = 1;
+        }
+        if (atomic_compare_exchange_weak(&job->cursor, &c, c + width)) {
+            int valid = job->batch - c;
+            *column_out = c;
+            *valid_out = valid > width ? width : valid;
+            return 1;
+        }
+    }
+}
 
 /* One worker loop: claim a tile, pack, evaluate on this worker's engine,
    unpack. Buffers are private to the worker; inputs and outputs are shared but
@@ -323,14 +435,10 @@ static void worker_run(Worker *w) {
         return;
     }
     for (;;) {
-        if (atomic_load(&job->failed))
+        int column, valid;
+        if (!claim_chunk(w, 0, &column, &valid))
             break;
-        int column = atomic_fetch_add(&job->cursor, width);
-        if (column >= job->batch)
-            break;
-        int valid = job->batch - column;
-        if (valid > width)
-            valid = width;
+        double t_chunk = now_ms();
         for (int i = 0; i < s->ninputs; i++)
             pack_tile(job->inputs[i], buf.in[i], s->in_ch[i], job->batch, width, column, valid);
         double ms = 0;
@@ -350,6 +458,8 @@ static void worker_run(Worker *w) {
         w->tiles++;
         for (int i = 0; i < s->noutputs; i++)
             unpack_tile(job->outputs[i], buf.out[i], s->out_ch[i], job->batch, width, column, valid);
+        if (ms > 0)
+            update_estimate(job->program, w->engine, now_ms() - t_chunk);
     }
     tilebuf_free(s, &buf);
 }
@@ -361,11 +471,20 @@ static int gpu_pipeline_enabled(void) {
 
 /* Wait for a submitted GPU chunk and unpack it. If the GPU reports an error,
    recompute the chunk on the interpreter from the slot's still-packed input. */
-static void gpu_finish(Worker *w, float **in, float **out, int slot, int column, int valid) {
+static void gpu_finish(Worker *w, float **in, float **out, int slot, int column, int valid,
+                       double submitted_ms, double *last_done_ms) {
     SplitJob *job = w->job;
     const IOShape *s = job->shape;
     double ms = 0;
-    if (aner_gpu_wait(w->handle, slot, &ms) != 0) {
+    int gpu_ok = aner_gpu_wait(w->handle, slot, &ms) == 0;
+    if (gpu_ok) {
+        /* A chunk queued behind another started when that one finished. */
+        double done = now_ms();
+        double start = submitted_ms > *last_done_ms ? submitted_ms : *last_done_ms;
+        update_estimate(job->program, w->engine, done - start);
+        *last_done_ms = done;
+    }
+    if (!gpu_ok) {
         ms = 0;
         if (aner_cpu_run(job->program->graph, w->tile_width, (const float *const *)in, out) != 0) {
             atomic_store(&job->failed, 1);
@@ -389,6 +508,8 @@ static void gpu_worker_pipelined(Worker *w) {
     float **out_ptr[2] = {NULL, NULL};
     int pend_col[2] = {-1, -1};
     int pend_valid[2] = {0, 0};
+    double pend_submit[2] = {0, 0};
+    double last_done = 0;
     for (int k = 0; k < 2; k++) {
         in_ptr[k] = calloc((size_t)(s->ninputs > 0 ? s->ninputs : 1), sizeof(float *));
         out_ptr[k] = calloc((size_t)(s->noutputs > 0 ? s->noutputs : 1), sizeof(float *));
@@ -410,21 +531,16 @@ static void gpu_worker_pipelined(Worker *w) {
     int slot = 0;
     for (;;) {
         int column = -1, valid = 0;
-        if (!atomic_load(&job->failed)) {
-            int c = atomic_fetch_add(&job->cursor, width);
-            if (c < job->batch) {
-                column = c;
-                valid = job->batch - c;
-                if (valid > width)
-                    valid = width;
-            }
-        }
+        int pending = (pend_col[0] >= 0) + (pend_col[1] >= 0);
+        if (!claim_chunk(w, pending, &column, &valid))
+            column = -1;
         if (column >= 0) {
             for (int i = 0; i < s->ninputs; i++)
                 pack_tile(job->inputs[i], in_ptr[slot][i], s->in_ch[i], job->batch, width, column, valid);
             if (aner_gpu_submit(w->handle, slot) == 0) {
                 pend_col[slot] = column;
                 pend_valid[slot] = valid;
+                pend_submit[slot] = now_ms();
             } else if (aner_cpu_run(job->program->graph, width, (const float *const *)in_ptr[slot],
                                     out_ptr[slot]) == 0) {
                 /* Could not launch: this chunk ran on the interpreter instead. */
@@ -437,12 +553,14 @@ static void gpu_worker_pipelined(Worker *w) {
         }
         int other = slot ^ 1;
         if (pend_col[other] >= 0) {
-            gpu_finish(w, in_ptr[other], out_ptr[other], other, pend_col[other], pend_valid[other]);
+            gpu_finish(w, in_ptr[other], out_ptr[other], other, pend_col[other], pend_valid[other],
+                       pend_submit[other], &last_done);
             pend_col[other] = -1;
         }
         if (column < 0) {
             if (pend_col[slot] >= 0) {
-                gpu_finish(w, in_ptr[slot], out_ptr[slot], slot, pend_col[slot], pend_valid[slot]);
+                gpu_finish(w, in_ptr[slot], out_ptr[slot], slot, pend_col[slot], pend_valid[slot],
+                           pend_submit[slot], &last_done);
                 pend_col[slot] = -1;
             }
             break;
@@ -485,6 +603,7 @@ static int run_concurrent_batch(AnerProgram *program, const IOShape *shape,
     job.batch = batch;
     atomic_store(&job.cursor, 0);
     atomic_store(&job.failed, 0);
+    job.nworkers = 0;
 
     Worker workers[2];
     int nworkers = 0;
@@ -494,6 +613,9 @@ static int run_concurrent_batch(AnerProgram *program, const IOShape *shape,
         workers[nworkers].handle = program->ane;
         workers[nworkers].tile_width = program->spatial;
         workers[nworkers].pipelined = 0;
+        workers[nworkers].engine = 0;
+        workers[nworkers].other_width = program->gpu_spatial;
+        workers[nworkers].forced = 0;
         workers[nworkers].busy_ms = 0;
         workers[nworkers].tiles = 0;
         nworkers++;
@@ -504,12 +626,17 @@ static int run_concurrent_batch(AnerProgram *program, const IOShape *shape,
         workers[nworkers].handle = program->gpu;
         workers[nworkers].tile_width = program->gpu_spatial;
         workers[nworkers].pipelined = gpu_pipeline_enabled();
+        workers[nworkers].engine = 1;
+        workers[nworkers].other_width = program->spatial;
+        workers[nworkers].forced = 0;
         workers[nworkers].busy_ms = 0;
         workers[nworkers].tiles = 0;
         nworkers++;
     }
     if (nworkers == 0)
         return -1;
+    job.nworkers = nworkers;
+    atomic_store(&job.active, nworkers);
 
     pthread_t threads[2];
     for (int i = 1; i < nworkers; i++)
