@@ -1,6 +1,8 @@
 #include "aner.h"
 #include "internal.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -10,11 +12,28 @@ const char *aner_version(void) {
 
 struct AnerProgram {
     AnerGraph *graph;
-    int spatial;
+    int spatial;      /* ANE tile width, and the single-tile width */
+    int gpu_spatial;  /* GPU chunk width; a multiple of spatial for split runs */
+    AnerSchedule schedule;
     int on_ane;
+    int on_gpu;
     void *ane;
+    void *gpu;
     double compile_ms;
 };
+
+/* The GPU is far more efficient on wide chunks than on one 64-column tile: a
+   128-step chain runs at ~13 TFLOPS on 2048 columns but under 3 on 64, because
+   each dispatch pays a fixed launch cost. So the GPU backend compiles for a
+   wide spatial, the largest multiple of the caller's tile that does not exceed
+   this target, and a batch is fed to it one wide chunk at a time. */
+static int gpu_split_spatial(int ane_spatial) {
+    int target = 2048;
+    int width = ane_spatial;
+    while (width + ane_spatial <= target)
+        width += ane_spatial;
+    return width;
+}
 
 static int graph_ok(const AnerGraph *graph, int spatial) {
     if (!graph || spatial <= 0 || graph->ninputs < 1 || graph->noutputs < 1)
@@ -28,7 +47,7 @@ static int graph_ok(const AnerGraph *graph, int spatial) {
     return 1;
 }
 
-AnerProgram *aner_compile(const AnerGraph *graph, int spatial) {
+AnerProgram *aner_compile_scheduled(const AnerGraph *graph, int spatial, AnerSchedule schedule) {
     if (!graph_ok(graph, spatial))
         return NULL;
     AnerProgram *program = calloc(1, sizeof(AnerProgram));
@@ -40,21 +59,47 @@ AnerProgram *aner_compile(const AnerGraph *graph, int spatial) {
     }
     program->graph = owned;
     program->spatial = spatial;
-    program->ane = aner_ane_compile(owned, spatial, &program->compile_ms);
-    program->on_ane = program->ane != NULL;
+    /* Both GPU schedules widen the GPU's spatial: Metal is starved by 64-column
+       dispatches, so one dispatch should cover many tiles' worth of columns.
+       The width is a multiple of the caller's spatial, so a batch tiles evenly
+       and, in a split, the GPU's chunk stays aligned with the Neural Engine's
+       tiles on the shared cursor. */
+    program->gpu_spatial = schedule == ANER_SCHED_ANE ? spatial : gpu_split_spatial(spatial);
+    program->schedule = schedule;
+
+    double ane_ms = 0, gpu_ms = 0;
+    if (schedule == ANER_SCHED_ANE || schedule == ANER_SCHED_SPLIT) {
+        program->ane = aner_ane_compile(owned, spatial, &ane_ms);
+        program->on_ane = program->ane != NULL;
+    }
+    if (schedule == ANER_SCHED_GPU || schedule == ANER_SCHED_SPLIT) {
+        program->gpu = aner_gpu_compile(owned, program->gpu_spatial, &gpu_ms);
+        program->on_gpu = program->gpu != NULL;
+    }
+    /* Report the slower compile; both happen before the first run. */
+    program->compile_ms = ane_ms > gpu_ms ? ane_ms : gpu_ms;
     return program;
+}
+
+AnerProgram *aner_compile(const AnerGraph *graph, int spatial) {
+    return aner_compile_scheduled(graph, spatial, ANER_SCHED_ANE);
 }
 
 void aner_program_free(AnerProgram *program) {
     if (!program)
         return;
     aner_ane_release(program->ane);
+    aner_gpu_release(program->gpu);
     aner_graph_free(program->graph);
     free(program);
 }
 
 int aner_uses_neural_engine(const AnerProgram *program) {
     return program && program->on_ane;
+}
+
+int aner_uses_gpu(const AnerProgram *program) {
+    return program && program->on_gpu;
 }
 
 double aner_compile_milliseconds(const AnerProgram *program) {
@@ -65,6 +110,14 @@ int aner_run_reference(const AnerGraph *graph, int spatial, const float *const *
     return aner_cpu_run(graph, spatial, inputs, outputs);
 }
 
+/* Evaluate `valid` columns on the GPU program, which is compiled for
+   program->gpu_spatial. When the caller's tile is narrower (the single-tile
+   path, where valid == program->spatial <= gpu_spatial), the input is
+   zero-padded up to the compiled width and only the valid columns are read
+   back. When valid == gpu_spatial this is a plain pass-through. */
+static int gpu_eval_tile(AnerProgram *program, const float *const *inputs, float *const *outputs,
+                         int valid, double *exec_ms);
+
 int aner_run(AnerProgram *program, const float *const *inputs, float *const *outputs, double *exec_ms) {
     if (!program)
         return -1;
@@ -73,6 +126,12 @@ int aner_run(AnerProgram *program, const float *const *inputs, float *const *out
         if (rc == 0)
             return 0;
         program->on_ane = 0;
+    }
+    if (program->on_gpu) {
+        int rc = gpu_eval_tile(program, inputs, outputs, program->spatial, exec_ms);
+        if (rc == 0)
+            return 0;
+        program->on_gpu = 0;
     }
     if (exec_ms)
         *exec_ms = 0;
@@ -90,6 +149,304 @@ static void unpack_tile(float *dst, const float *tile, int channels, int batch, 
         memcpy(dst + (size_t)c * batch + column0, tile + (size_t)c * spatial, sizeof(float) * (size_t)valid);
 }
 
+static int gpu_eval_tile(AnerProgram *program, const float *const *inputs, float *const *outputs,
+                         int valid, double *exec_ms) {
+    int width = program->gpu_spatial;
+    if (valid == width)
+        return aner_gpu_eval(program->gpu, inputs, outputs, exec_ms);
+    if (valid > width)
+        return -1;
+    /* Narrow tile: pad each input up to the compiled width, read back valid. */
+    const AnerGraph *g = program->graph;
+    int rc = 0;
+    const float **pin = calloc((size_t)g->ninputs, sizeof(float *));
+    float **pout = calloc((size_t)g->noutputs, sizeof(float *));
+    if ((g->ninputs && !pin) || (g->noutputs && !pout)) {
+        free(pin); free(pout);
+        return -1;
+    }
+    for (int i = 0; i < g->nops && rc == 0; i++) {
+        const AnerOp *op = &g->ops[i];
+        if (op->kind == ANER_INPUT) {
+            int idx = op->input_index;
+            pin[idx] = calloc((size_t)op->channels * (size_t)width, sizeof(float));
+            if (!pin[idx]) { rc = -1; break; }
+            for (int c = 0; c < op->channels; c++)
+                memcpy((float *)pin[idx] + (size_t)c * width,
+                       inputs[idx] + (size_t)c * valid, sizeof(float) * (size_t)valid);
+        }
+        if (op->is_output) {
+            int idx = op->output_index;
+            if (!pout[idx]) {
+                pout[idx] = calloc((size_t)op->channels * (size_t)width, sizeof(float));
+                if (!pout[idx]) { rc = -1; break; }
+            }
+        }
+    }
+    if (rc == 0)
+        rc = aner_gpu_eval(program->gpu, pin, pout, exec_ms);
+    if (rc == 0) {
+        for (int i = 0; i < g->nops; i++) {
+            const AnerOp *op = &g->ops[i];
+            if (!op->is_output)
+                continue;
+            int idx = op->output_index;
+            for (int c = 0; c < op->channels; c++)
+                memcpy(outputs[idx] + (size_t)c * valid,
+                       pout[idx] + (size_t)c * width, sizeof(float) * (size_t)valid);
+        }
+    }
+    for (int i = 0; i < g->ninputs; i++)
+        free((void *)pin[i]);
+    for (int i = 0; i < g->noutputs; i++)
+        free(pout[i]);
+    free(pin);
+    free(pout);
+    return rc;
+}
+
+/* Channel counts for inputs and outputs, in slot order. */
+typedef struct {
+    int ninputs;
+    int noutputs;
+    int *in_ch;
+    int *out_ch;
+} IOShape;
+
+static int io_shape_init(const AnerGraph *graph, IOShape *s) {
+    s->ninputs = graph->ninputs;
+    s->noutputs = graph->noutputs;
+    s->in_ch = calloc((size_t)graph->ninputs, sizeof(int));
+    s->out_ch = calloc((size_t)graph->noutputs, sizeof(int));
+    if ((graph->ninputs && !s->in_ch) || (graph->noutputs && !s->out_ch)) {
+        free(s->in_ch);
+        free(s->out_ch);
+        return -1;
+    }
+    for (int i = 0; i < graph->nops; i++) {
+        const AnerOp *op = &graph->ops[i];
+        if (op->kind == ANER_INPUT)
+            s->in_ch[op->input_index] = op->channels;
+        if (op->is_output)
+            s->out_ch[op->output_index] = op->channels;
+    }
+    return 0;
+}
+
+static void io_shape_free(IOShape *s) {
+    free(s->in_ch);
+    free(s->out_ch);
+}
+
+/* Per-worker scratch: its own packed tile buffers so two threads never touch
+   the same memory. */
+typedef struct {
+    float **in;
+    float **out;
+} TileBuf;
+
+static int tilebuf_init(const IOShape *s, int spatial, TileBuf *b) {
+    b->in = calloc((size_t)s->ninputs, sizeof(float *));
+    b->out = calloc((size_t)s->noutputs, sizeof(float *));
+    if ((s->ninputs && !b->in) || (s->noutputs && !b->out))
+        return -1;
+    for (int i = 0; i < s->ninputs; i++) {
+        b->in[i] = calloc((size_t)s->in_ch[i] * (size_t)spatial, sizeof(float));
+        if (!b->in[i])
+            return -1;
+    }
+    for (int i = 0; i < s->noutputs; i++) {
+        b->out[i] = calloc((size_t)s->out_ch[i] * (size_t)spatial, sizeof(float));
+        if (!b->out[i])
+            return -1;
+    }
+    return 0;
+}
+
+static void tilebuf_free(const IOShape *s, TileBuf *b) {
+    if (b->in)
+        for (int i = 0; i < s->ninputs; i++)
+            free(b->in[i]);
+    if (b->out)
+        for (int i = 0; i < s->noutputs; i++)
+            free(b->out[i]);
+    free(b->in);
+    free(b->out);
+}
+
+typedef int (*TileEval)(void *handle, const float *const *inputs, float *const *outputs, double *exec_ms);
+
+/* Shared across the two workers of a split run. The cursor is the next column
+   not yet claimed; each worker atomically grabs a chunk of its own width. The
+   ANE worker claims 64-column tiles; the GPU worker claims a wide chunk so one
+   dispatch covers many tiles. Both widths are multiples of the base tile, so
+   whichever worker grabs a column range, the range is tile-aligned and never
+   overlaps another worker's range. */
+typedef struct {
+    AnerProgram *program;
+    const IOShape *shape;
+    const float *const *inputs;
+    float *const *outputs;
+    int batch;
+    _Atomic int cursor;
+    _Atomic int failed;
+} SplitJob;
+
+typedef struct {
+    SplitJob *job;
+    TileEval eval;
+    void *handle;
+    int tile_width;   /* columns this worker claims and its engine was compiled for */
+    double busy_ms;
+    int tiles;
+} Worker;
+
+/* One worker loop: claim a tile, pack, evaluate on this worker's engine,
+   unpack. Buffers are private to the worker; inputs and outputs are shared but
+   each column belongs to exactly one tile, so writes never overlap. */
+static void worker_run(Worker *w) {
+    SplitJob *job = w->job;
+    const IOShape *s = job->shape;
+    int width = w->tile_width;
+    TileBuf buf;
+    memset(&buf, 0, sizeof(buf));
+    if (tilebuf_init(s, width, &buf) != 0) {
+        atomic_store(&job->failed, 1);
+        tilebuf_free(s, &buf);
+        return;
+    }
+    for (;;) {
+        if (atomic_load(&job->failed))
+            break;
+        int column = atomic_fetch_add(&job->cursor, width);
+        if (column >= job->batch)
+            break;
+        int valid = job->batch - column;
+        if (valid > width)
+            valid = width;
+        for (int i = 0; i < s->ninputs; i++)
+            pack_tile(job->inputs[i], buf.in[i], s->in_ch[i], job->batch, width, column, valid);
+        double ms = 0;
+        int rc = w->eval(w->handle, (const float *const *)buf.in, buf.out, &ms);
+        if (rc != 0) {
+            /* Engine failed this chunk. Recover on the interpreter rather than
+               failing the whole batch, matching aner_run's fallback. The chunk
+               is already packed to this worker's width in buf. */
+            ms = 0;
+            rc = aner_cpu_run(job->program->graph, width, (const float *const *)buf.in, buf.out);
+            if (rc != 0) {
+                atomic_store(&job->failed, 1);
+                break;
+            }
+        }
+        w->busy_ms += ms;
+        w->tiles++;
+        for (int i = 0; i < s->noutputs; i++)
+            unpack_tile(job->outputs[i], buf.out[i], s->out_ch[i], job->batch, width, column, valid);
+    }
+    tilebuf_free(s, &buf);
+}
+
+static void *worker_thunk(void *arg) {
+    worker_run((Worker *)arg);
+    return NULL;
+}
+
+/* Run a wide batch across the engines this schedule enables, each taking the
+   next chunk of columns as it frees up, at its own tile width. With both
+   engines the faster one naturally does more work and the run finishes near
+   the busier engine's time; with one engine this is a single worker tiling at
+   that engine's width (a wide chunk for the GPU, a 64-column tile for the ANE).
+   Returns 0, or a negative code if a chunk failed and nothing recovered it. */
+static int run_concurrent_batch(AnerProgram *program, const IOShape *shape,
+                                const float *const *inputs, float *const *outputs,
+                                int batch, double *exec_ms) {
+    SplitJob job;
+    job.program = program;
+    job.shape = shape;
+    job.inputs = inputs;
+    job.outputs = outputs;
+    job.batch = batch;
+    atomic_store(&job.cursor, 0);
+    atomic_store(&job.failed, 0);
+
+    Worker workers[2];
+    int nworkers = 0;
+    if (program->on_ane) {
+        workers[nworkers].job = &job;
+        workers[nworkers].eval = aner_ane_eval;
+        workers[nworkers].handle = program->ane;
+        workers[nworkers].tile_width = program->spatial;
+        workers[nworkers].busy_ms = 0;
+        workers[nworkers].tiles = 0;
+        nworkers++;
+    }
+    if (program->on_gpu) {
+        workers[nworkers].job = &job;
+        workers[nworkers].eval = aner_gpu_eval;
+        workers[nworkers].handle = program->gpu;
+        workers[nworkers].tile_width = program->gpu_spatial;
+        workers[nworkers].busy_ms = 0;
+        workers[nworkers].tiles = 0;
+        nworkers++;
+    }
+    if (nworkers == 0)
+        return -1;
+
+    pthread_t threads[2];
+    for (int i = 1; i < nworkers; i++)
+        pthread_create(&threads[i], NULL, worker_thunk, &workers[i]);
+    worker_run(&workers[0]);          /* run worker 0 on the calling thread */
+    for (int i = 1; i < nworkers; i++)
+        pthread_join(threads[i], NULL);
+
+    if (atomic_load(&job.failed))
+        return -1;
+    if (exec_ms) {
+        /* Wall time is dominated by the busier engine; report that. */
+        double m = 0;
+        for (int i = 0; i < nworkers; i++)
+            if (workers[i].busy_ms > m)
+                m = workers[i].busy_ms;
+        *exec_ms = m;
+    }
+    return 0;
+}
+
+/* Serial batch: pack, run one tile through aner_run (which carries its own
+   engine fallback), unpack. Used for single-engine schedules and as the
+   fallback when a split cannot run concurrently. */
+static int run_serial_batch(AnerProgram *program, const IOShape *shape,
+                            const float *const *inputs, float *const *outputs,
+                            int batch, double *exec_ms) {
+    int spatial = program->spatial;
+    TileBuf buf;
+    memset(&buf, 0, sizeof(buf));
+    if (tilebuf_init(shape, spatial, &buf) != 0) {
+        tilebuf_free(shape, &buf);
+        return -1;
+    }
+    int rc = 0;
+    double total = 0;
+    for (int column = 0; rc == 0 && column < batch; column += spatial) {
+        int valid = batch - column;
+        if (valid > spatial)
+            valid = spatial;
+        for (int i = 0; i < shape->ninputs; i++)
+            pack_tile(inputs[i], buf.in[i], shape->in_ch[i], batch, spatial, column, valid);
+        double ms = 0;
+        rc = aner_run(program, (const float *const *)buf.in, buf.out, &ms);
+        total += ms;
+        if (rc == 0)
+            for (int i = 0; i < shape->noutputs; i++)
+                unpack_tile(outputs[i], buf.out[i], shape->out_ch[i], batch, spatial, column, valid);
+    }
+    if (exec_ms)
+        *exec_ms = total;
+    tilebuf_free(shape, &buf);
+    return rc;
+}
+
 int aner_run_batch(AnerProgram *program, const float *const *inputs, float *const *outputs, int batch, double *exec_ms) {
     if (!program || batch <= 0)
         return -1;
@@ -97,58 +454,21 @@ int aner_run_batch(AnerProgram *program, const float *const *inputs, float *cons
     if (batch == spatial)
         return aner_run(program, inputs, outputs, exec_ms);
 
-    int ninputs = program->graph->ninputs;
-    int noutputs = program->graph->noutputs;
-    const float **tile_in = calloc((size_t)ninputs, sizeof(float *));
-    float **tile_out = calloc((size_t)noutputs, sizeof(float *));
-    int *in_ch = calloc((size_t)ninputs, sizeof(int));
-    int *out_ch = calloc((size_t)noutputs, sizeof(int));
-    if (!tile_in || !tile_out || !in_ch || !out_ch) {
-        free(tile_in); free(tile_out); free(in_ch); free(out_ch);
+    IOShape shape;
+    if (io_shape_init(program->graph, &shape) != 0)
         return -1;
-    }
-    for (int i = 0; i < program->graph->nops; i++) {
-        const AnerOp *op = &program->graph->ops[i];
-        if (op->kind == ANER_INPUT)
-            in_ch[op->input_index] = op->channels;
-        if (op->is_output)
-            out_ch[op->output_index] = op->channels;
-    }
-    int rc = 0;
-    for (int i = 0; i < ninputs; i++) {
-        tile_in[i] = calloc((size_t)in_ch[i] * (size_t)spatial, sizeof(float));
-        if (!tile_in[i])
-            rc = -1;
-    }
-    for (int i = 0; i < noutputs; i++) {
-        tile_out[i] = calloc((size_t)out_ch[i] * (size_t)spatial, sizeof(float));
-        if (!tile_out[i])
-            rc = -1;
-    }
-    double total = 0;
-    for (int column = 0; rc == 0 && column < batch; column += spatial) {
-        int valid = batch - column;
-        if (valid > spatial)
-            valid = spatial;
-        for (int i = 0; i < ninputs; i++)
-            pack_tile(inputs[i], (float *)tile_in[i], in_ch[i], batch, spatial, column, valid);
-        double ms = 0;
-        rc = aner_run(program, tile_in, tile_out, &ms);
-        total += ms;
-        if (rc == 0) {
-            for (int i = 0; i < noutputs; i++)
-                unpack_tile(outputs[i], tile_out[i], out_ch[i], batch, spatial, column, valid);
-        }
-    }
-    if (exec_ms)
-        *exec_ms = total;
-    for (int i = 0; i < ninputs; i++)
-        free((void *)tile_in[i]);
-    for (int i = 0; i < noutputs; i++)
-        free(tile_out[i]);
-    free(tile_in);
-    free(tile_out);
-    free(in_ch);
-    free(out_ch);
+
+    /* The concurrent path tiles each engine at its own width, so it is the one
+       that feeds the GPU wide chunks. Use it whenever the GPU is live (split or
+       GPU-only). ANE-only stays on the serial path: its tile is the compiled
+       spatial, so per-tile aner_run is already optimal and avoids thread setup.
+       If the GPU fell back at compile time, on_gpu is 0 and this stays serial. */
+    int rc;
+    if (program->on_gpu && batch > spatial)
+        rc = run_concurrent_batch(program, &shape, inputs, outputs, batch, exec_ms);
+    else
+        rc = run_serial_batch(program, &shape, inputs, outputs, batch, exec_ms);
+
+    io_shape_free(&shape);
     return rc;
 }

@@ -293,6 +293,68 @@ static int test_gelu_and_repeat(void) {
     return bad;
 }
 
+static int test_gpu_chain(void) {
+    const int n = 512, sp = 64, batch = 512;
+    float *A = calloc((size_t)n * n, sizeof(float));
+    float *X = calloc((size_t)n * batch, sizeof(float));
+    float *Y = calloc((size_t)n * batch, sizeof(float));
+    float *ref = calloc((size_t)n * batch, sizeof(float));
+    fill_matrix(A, n, 0.5f, 0.1f, 1);
+    fill_state(X, n, batch);
+
+    AnerGraph *g = aner_graph_new();
+    aner_output(g, aner_repeat(g, aner_input(g, n), 8, A));
+    const float *ins[] = {X};
+    if (aner_run_reference(g, batch, ins, (float *const[]){ref}) != 0)
+        return 1;
+
+    AnerProgram *p = aner_compile_scheduled(g, sp, ANER_SCHED_GPU);
+    int on_gpu = aner_uses_gpu(p);
+    int on_ane = aner_uses_neural_engine(p);
+    double ms = 0;
+    int rc = aner_run_batch(p, ins, (float *const[]){Y}, batch, &ms);
+    printf("GPU 8-step chain: on_gpu %d, on_ane %d, batch %d eval %.2f ms, rc %d\n",
+           on_gpu, on_ane, batch, ms, rc);
+    int bad = !on_gpu || on_ane || rc != 0 || expect_close("gpu chain vs float32 reference", Y, ref, n * batch, 2e-3f);
+    aner_graph_free(g);
+    aner_program_free(p);
+    free(A); free(X); free(Y); free(ref);
+    return bad;
+}
+
+static int test_split_matches_ane(void) {
+    const int n = 512, sp = 64, batch = 4096;
+    float *A = calloc((size_t)n * n, sizeof(float));
+    float *X = calloc((size_t)n * batch, sizeof(float));
+    float *Ysplit = calloc((size_t)n * batch, sizeof(float));
+    float *Yane = calloc((size_t)n * batch, sizeof(float));
+    fill_matrix(A, n, 0.9f, 0.03f, 1);
+    fill_state(X, n, batch);
+
+    AnerGraph *g = aner_graph_new();
+    aner_output(g, aner_repeat(g, aner_input(g, n), 64, A));
+    const float *ins[] = {X};
+
+    AnerProgram *split = aner_compile_scheduled(g, sp, ANER_SCHED_SPLIT);
+    AnerProgram *ane = aner_compile_scheduled(g, sp, ANER_SCHED_ANE);
+    int on_ane = aner_uses_neural_engine(split);
+    int on_gpu = aner_uses_gpu(split);
+    double splitMs = 0, aneMs = 0;
+    int rcs = aner_run_batch(split, ins, (float *const[]){Ysplit}, batch, &splitMs);
+    int rca = aner_run_batch(ane, ins, (float *const[]){Yane}, batch, &aneMs);
+    printf("split: ane %d + gpu %d, batch %d, split eval %.2f ms vs ane-only %.2f ms, rc %d/%d\n",
+           on_ane, on_gpu, batch, splitMs, aneMs, rcs, rca);
+    /* Both engines compute in fp16, so the split matches the ANE-only run to
+       fp16 rounding, not to the float32 interpreter. */
+    int bad = !on_ane || !on_gpu || rcs != 0 || rca != 0
+        || expect_close("split vs ane-only", Ysplit, Yane, n * batch, 3e-2f);
+    aner_graph_free(g);
+    aner_program_free(split);
+    aner_program_free(ane);
+    free(A); free(X); free(Ysplit); free(Yane);
+    return bad;
+}
+
 int main(void) {
     int failed = 0;
     failed |= test_cpu_residual();
@@ -302,6 +364,8 @@ int main(void) {
     failed |= test_fields_and_product();
     failed |= test_const_scale_series();
     failed |= test_gelu_and_repeat();
+    failed |= test_gpu_chain();
+    failed |= test_split_matches_ane();
     printf("%s\n", failed ? "FAILED" : "ok");
     return failed ? 1 : 0;
 }

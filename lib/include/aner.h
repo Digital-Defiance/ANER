@@ -59,10 +59,36 @@ int aner_gelu(AnerGraph *graph, int input);
 /* Outputs are returned in the order they are marked. */
 int aner_output(AnerGraph *graph, int tensor);
 
-/* Copies the graph. The caller's graph may be freed after this returns. */
+/* Copies the graph. The caller's graph may be freed after this returns.
+   aner_compile keeps the historical behaviour: the Neural Engine when the
+   shape allows, otherwise the float32 interpreter. */
 AnerProgram *aner_compile(const AnerGraph *graph, int spatial);
+
+/* Batch scheduling across compute engines, chosen at compile time.
+
+   ANER_SCHED_ANE    Neural Engine only, then the interpreter. The default, and
+                     what aner_compile selects.
+   ANER_SCHED_GPU    Metal only, then the interpreter.
+   ANER_SCHED_SPLIT  Neural Engine and GPU at once. aner_run_batch hands each
+                     engine the next tile as it falls idle, so a wide batch runs
+                     on both. A single tile (aner_run, or a batch equal to the
+                     compiled spatial width) still runs on one engine. If either
+                     backend is unavailable the other carries the whole batch;
+                     if neither is, the interpreter does.
+
+   Results are fp16 on both engines, so a split batch matches an ANE-only batch
+   to fp16 rounding, not to the float32 interpreter. */
+typedef enum {
+    ANER_SCHED_ANE = 0,
+    ANER_SCHED_GPU = 1,
+    ANER_SCHED_SPLIT = 2
+} AnerSchedule;
+
+AnerProgram *aner_compile_scheduled(const AnerGraph *graph, int spatial, AnerSchedule schedule);
+
 void aner_program_free(AnerProgram *program);
 int aner_uses_neural_engine(const AnerProgram *program);
+int aner_uses_gpu(const AnerProgram *program);
 double aner_compile_milliseconds(const AnerProgram *program);
 
 /* Each input is channels × spatial. Each output buffer is likewise sized. */

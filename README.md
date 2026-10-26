@@ -64,6 +64,22 @@ Each tensor is `[channels, spatial]`, row-major, fp32 at the boundary. Spatial i
 
 The Neural Engine path requires every channel count to be a multiple of 64 and at most 512. Other shapes use the interpreter. On an M4 Max, a repeated 512×512 map at spatial 64 runs at about 13 TFLOPS once the chain is 128 steps; giving every step its own matrix drops that to about 7 TFLOPS because the weights no longer stay resident. fp16 is the on-chip format. A 128-step modal rollout differs from the float32 probe by a few hundredths on states of order 1.
 
+## Running on both engines
+
+`aner_compile_scheduled` picks the compute engines:
+
+| Schedule | Backend |
+| --- | --- |
+| `ANER_SCHED_ANE` | Neural Engine, then the interpreter. The default, and what `aner_compile` selects. |
+| `ANER_SCHED_GPU` | Metal, then the interpreter. |
+| `ANER_SCHED_SPLIT` | Neural Engine and GPU at once. |
+
+`aner_run_batch` tiles a wide batch across whichever engines the schedule enables, handing each the next chunk of columns as it falls idle. The Neural Engine takes 64-column tiles; the GPU takes a wide chunk in one dispatch, because Metal is far more efficient on wide inputs than on a single tile. Both GPU schedules use that wide chunk: `ANER_SCHED_GPU` feeds the whole batch to the GPU in wide dispatches, and `ANER_SCHED_SPLIT` runs the Neural Engine and GPU at once, the faster engine naturally taking more of the batch so the run finishes near the busier engine's time. A single tile (`aner_run`, or a batch equal to the compiled spatial width) runs on one engine. If one backend is unavailable the other carries the whole batch; if neither is, the interpreter does. `aner_uses_gpu` reports whether the Metal backend is live.
+
+The GPU runs the same op set as the Neural Engine (input, const, conv, scale, repeat, add, mul, sigmoid, and the pointwise helpers built from them), lowered to one MPSGraph executable at optimization level 0. Level 0 is deliberate: the default level 1 runs a placement pass that moves fp16 matmul chains onto the Neural Engine, which would put both halves of a split on the same engine. Both backends compute in fp16, so a split batch matches an Neural-Engine-only batch to fp16 rounding, not to the float32 interpreter.
+
+On an M4 Max, the 512-mode, 128-step, 4096-column rollout runs at about 12 TFLOPS on the Neural Engine alone, about 11 on the GPU alone, and about 23 split across both, close to 1.9× over either engine. The split gain needs a batch wide enough to keep both engines fed; a batch that fits in one tile runs on a single engine.
+
 ## Example
 
 Thirty-two steps of one map, 64 modes, 128 initial conditions, tiles of 64:
@@ -127,7 +143,15 @@ program = graph.compile(64)
 Y = program.run_batch(X)
 ```
 
-`Y` has shape `(n, batch)`. One output comes back as an array. Several outputs come back as a list, in the order they were marked. `program.uses_neural_engine` reports the live backend, and `program.eval_ms` is the last evaluation. `graph.reference(spatial, X)` runs the float32 interpreter. Float64 arrays are converted to float32.
+`Y` has shape `(n, batch)`. One output comes back as an array. Several outputs come back as a list, in the order they were marked. `program.uses_neural_engine` and `program.uses_gpu` report the live backends, and `program.eval_ms` is the last evaluation. `graph.reference(spatial, X)` runs the float32 interpreter. Float64 arrays are converted to float32.
+
+`graph.compile(spatial, aner.Schedule.SPLIT)` runs a wide batch on the Neural Engine and the GPU together. `aner.Schedule.GPU` uses Metal alone, and `aner.Schedule.ANE` (the default) uses the Neural Engine.
+
+```python
+program = graph.compile(64, aner.Schedule.SPLIT)
+Y = program.run_batch(X)          # 4096 columns spread across both engines
+assert program.uses_neural_engine and program.uses_gpu
+```
 
 `lib/examples/modal.c` is a 512-mode damped oscillator: 4096 initial conditions, 128 steps, then a sensor row and amplitude percentiles. After install it is `aner-modal`. From the build tree it is `lib/build/modal`.
 

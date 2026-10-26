@@ -13,7 +13,21 @@ from pathlib import Path
 
 import numpy as np
 
-__all__ = ["Graph", "Program", "Tensor", "version"]
+__all__ = ["Graph", "Program", "Schedule", "Tensor", "version"]
+
+
+class Schedule:
+    """Which compute engine(s) a program's batch runs on.
+
+    ANE    Neural Engine, then the interpreter. The default.
+    GPU    Metal, then the interpreter.
+    SPLIT  Neural Engine and GPU at once; a wide batch is handed to whichever
+           engine is free, so both run in parallel.
+    """
+
+    ANE = 0
+    GPU = 1
+    SPLIT = 2
 
 
 class _Graph(ctypes.Structure):
@@ -86,9 +100,13 @@ def _load():
     lib.aner_output.restype = ctypes.c_int
     lib.aner_compile.argtypes = [g, ctypes.c_int]
     lib.aner_compile.restype = p
+    lib.aner_compile_scheduled.argtypes = [g, ctypes.c_int, ctypes.c_int]
+    lib.aner_compile_scheduled.restype = p
     lib.aner_program_free.argtypes = [p]
     lib.aner_uses_neural_engine.argtypes = [p]
     lib.aner_uses_neural_engine.restype = ctypes.c_int
+    lib.aner_uses_gpu.argtypes = [p]
+    lib.aner_uses_gpu.restype = ctypes.c_int
     lib.aner_compile_milliseconds.argtypes = [p]
     lib.aner_compile_milliseconds.restype = ctypes.c_double
     lib.aner_run.argtypes = [p, fpp, fpp, ctypes.POINTER(ctypes.c_double)]
@@ -195,6 +213,11 @@ class Program:
         return bool(_lib.aner_uses_neural_engine(self._ptr))
 
     @property
+    def uses_gpu(self) -> bool:
+        self._require()
+        return bool(_lib.aner_uses_gpu(self._ptr))
+
+    @property
     def compile_ms(self) -> float:
         self._require()
         return float(_lib.aner_compile_milliseconds(self._ptr))
@@ -230,7 +253,15 @@ class Program:
         return outputs
 
     def __repr__(self) -> str:
-        where = "Neural Engine" if self._ptr and self.uses_neural_engine else "CPU"
+        if not self._ptr:
+            where = "closed"
+        else:
+            engines = []
+            if self.uses_neural_engine:
+                engines.append("Neural Engine")
+            if self.uses_gpu:
+                engines.append("GPU")
+            where = " + ".join(engines) if engines else "CPU"
         return f"Program({where}, spatial={self.spatial})"
 
 
@@ -346,13 +377,15 @@ class Graph:
         self._output_channels[index] = tensor.channels
         return index
 
-    def compile(self, spatial: int) -> Program:
+    def compile(self, spatial: int, schedule: int = Schedule.ANE) -> Program:
         self._require()
         if spatial <= 0:
             raise ValueError("spatial must be positive")
+        if schedule not in (Schedule.ANE, Schedule.GPU, Schedule.SPLIT):
+            raise ValueError("schedule must be a Schedule value")
         if not self._output_channels:
             raise RuntimeError("mark at least one output")
-        ptr = _lib.aner_compile(self._ptr, int(spatial))
+        ptr = _lib.aner_compile_scheduled(self._ptr, int(spatial), int(schedule))
         if not ptr:
             raise RuntimeError("aner_compile failed")
         return Program(ptr, int(spatial), self._input_channels, self._output_channels)

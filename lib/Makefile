@@ -1,6 +1,7 @@
 CC = clang
 CFLAGS = -fobjc-arc -O2 -I include -I src
-FRAMEWORKS = -framework Foundation -framework IOSurface -framework Accelerate
+FRAMEWORKS = -framework Foundation -framework IOSurface -framework Accelerate \
+             -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph
 VERSION := $(shell sed -n 's/.*ANER_VERSION_STRING "\([0-9.]*\)".*/\1/p' include/aner.h)
 
 PREFIX ?= /usr/local
@@ -9,7 +10,7 @@ INCLUDEDIR = $(PREFIX)/include
 LIBDIR = $(PREFIX)/lib
 PKGCONFIGDIR = $(LIBDIR)/pkgconfig
 
-LIB_OBJS = build/graph.o build/cpu.o build/program.o build/ane.o build/lut6.o
+LIB_OBJS = build/graph.o build/cpu.o build/program.o build/ane.o build/gpu.o build/lut6.o
 
 .PHONY: all test python-test install uninstall clean
 
@@ -29,6 +30,9 @@ build/program.o: src/program.c include/aner.h src/internal.h | build
 
 build/ane.o: src/ane.m include/aner.h src/internal.h | build
 	$(CC) $(CFLAGS) -c src/ane.m -o $@
+
+build/gpu.o: src/gpu.m include/aner.h src/internal.h | build
+	$(CC) $(CFLAGS) -c src/gpu.m -o $@
 
 build/lut6.o: src/lut6.c include/aner.h include/aner_lut6.h | build
 	$(CC) $(CFLAGS) -c src/lut6.c -o $@

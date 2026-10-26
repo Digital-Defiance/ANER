@@ -7,5 +7,5 @@ Name: aner
 Description: Ensemble numerical graphs for the Apple Neural Engine
 Version: @version@
 Libs: -L${libdir} -laner -Wl,-rpath,${libdir}
-Libs.private: -framework Foundation -framework IOSurface -framework Accelerate
+Libs.private: -framework Foundation -framework IOSurface -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph
 Cflags: -I${includedir}

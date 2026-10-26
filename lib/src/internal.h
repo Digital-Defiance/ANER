@@ -40,4 +40,12 @@ void *aner_ane_compile(const AnerGraph *graph, int spatial, double *compile_ms);
 int aner_ane_eval(void *handle, const float *const *inputs, float *const *outputs, double *exec_ms);
 void aner_ane_release(void *handle);
 
+/* GPU backend. Compiles the whole graph to an MPSGraph executable at
+   optimization level 0 so the work stays on Metal rather than being placed on
+   the Neural Engine. A spatial width is fixed at compile time, as on the ANE.
+   Returns NULL if Metal is unavailable or the graph cannot be lowered. */
+void *aner_gpu_compile(const AnerGraph *graph, int spatial, double *compile_ms);
+int aner_gpu_eval(void *handle, const float *const *inputs, float *const *outputs, double *exec_ms);
+void aner_gpu_release(void *handle);
+
 #endif

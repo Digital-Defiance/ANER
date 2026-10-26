@@ -80,6 +80,25 @@ class AnerTests(unittest.TestCase):
         self.assertAlmostEqual(result.fundamental_retained, 90, delta=0.5)
         self.assertAlmostEqual(result.highest_retained, 16, delta=0.5)
 
+    def test_split_matches_ane(self):
+        n, steps, batch = 512, 64, 4096
+        matrix = np.zeros((n, n), np.float32)
+        np.fill_diagonal(matrix, 0.9)
+        matrix[np.arange(n), (np.arange(n) + 1) % n] = 0.03
+        state = np.linspace(-0.3, 0.3, n * batch, dtype=np.float32).reshape(n, batch)
+
+        graph = aner.Graph()
+        graph.output(graph.repeat(graph.input(n), steps, matrix))
+        with graph.compile(64, aner.Schedule.ANE) as on_ane, \
+             graph.compile(64, aner.Schedule.SPLIT) as split:
+            self.assertTrue(on_ane.uses_neural_engine)
+            self.assertTrue(split.uses_neural_engine)
+            self.assertTrue(split.uses_gpu)
+            ane_out = on_ane.run_batch(state)
+            split_out = split.run_batch(state)
+        # Both engines compute in fp16, so the two agree to fp16 rounding.
+        self.assertLess(float(np.max(np.abs(split_out - ane_out))), 3e-2)
+
     def test_horner_reference(self):
         graph = aner.Graph()
         graph.output(graph.horner(graph.input(4), [0.1, -0.25, 0.05]))
